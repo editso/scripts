@@ -58,15 +58,23 @@ def connect_to_jdwp(sdk: str, port):
 def upload_dbg(srv: str, name: str, serial: None):
     remote_path = f'/data/local/tmp/{name}'
 
-    try:
-        retval = adb_command('shell', f'stat {remote_path}')
-    except ChildProcessError as e:
-        retval = str(e)
+    if not os.path.exists(srv):
+        raise FileNotFoundError(srv)
 
-    if 'No such file or directory' not in retval:
-        return remote_path
+    try:
+
+        with open(srv, 'rb') as f:
+            ida_sha1 = hashlib.sha1(f.read()).hexdigest()
+            retval = adb_command(
+                'shell', f'sha1sum {remote_path}', serial).split(" ")[0]
+            if retval == ida_sha1:
+                return remote_path
+
+    except ChildProcessError:
+        pass
 
     adb_command('push', [srv, remote_path], serial)
+
     return remote_path
 
 
@@ -84,7 +92,7 @@ def starting_ida(srv: str, port: str, serial: None):
             adb_command('shell', f'chmod +x {ida_prog}', serial)
             adb_command('shell', f'{ida_prog} -p {port} -K', serial)
         except Exception as e:
-            print('Ida DebuggerServer launch fail {}'.format(e))
+            print('Ida DebuggerServer stopped {}'.format(e))
 
     adb_command('forward', [f'tcp:{port}', f'tcp:{port}'], serial)
 
