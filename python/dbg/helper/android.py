@@ -189,7 +189,7 @@ def starting_frida(srv: str):
     print(f"[+] FridaServer Listen on 127.0.0.1:{srv_port}")
 
 
-def run_dbg(apk: str, only_run=False, sdk=None, jdwp=5986, package=None, activity=None):
+def run_dbg(apk: str, clean=False, only_run=False, sdk=None, jdwp=5986, package=None, activity=None):
     debugger = helper.use_dbg
     debug_package = package
     main_activity = activity
@@ -204,6 +204,7 @@ def run_dbg(apk: str, only_run=False, sdk=None, jdwp=5986, package=None, activit
 
     if apk != "--" and not package:
         adb_shell(f"pm install {remote_path}")
+
         retval = adb_shell("""pm list packages -3 -f | sed -r 's/package:(.*)=(.*)/\\1 \\2/' | awk '{system("sha1sum " $1 "|xargs echo " $2);}'""").split("\n")
 
         for app in retval:
@@ -213,6 +214,9 @@ def run_dbg(apk: str, only_run=False, sdk=None, jdwp=5986, package=None, activit
 
         if not debug_package:
             raise FileExistsError(f"{apk} install fail")
+
+    if clean:
+        adb_shell(f"pm clear {debug_package}")
 
     if not main_activity:
         retval = adb_shell(f"dumpsys package {debug_package}")
@@ -248,7 +252,8 @@ def run_dbg(apk: str, only_run=False, sdk=None, jdwp=5986, package=None, activit
     if only_run:
         return
 
-    ({"ida": starting_ida, "frida": starting_frida})[debugger](helper.dbg_srv)
+    if helper.dbg_srv:
+        ({"ida": starting_ida, "frida": starting_frida})[debugger](helper.dbg_srv)
 
     if helper.skip_jdwp:
         return
@@ -315,7 +320,7 @@ def run_main(app: argparse.Namespace):
     helper.apk_push_path = app.apk_path
     helper.dbg_push_path = app.dbg_path
 
-    run_dbg(app.APK, app.run, app.sdk, app.jdwp, app.package, app.activity)
+    run_dbg(app.APK, app.clear, app.run, app.sdk, app.jdwp, app.package, app.activity)
 
 
 if __name__ == "__main__":
@@ -331,6 +336,7 @@ if __name__ == "__main__":
     ap.add_argument("-r", "--run", default=False, action="store_true", help="Run but not debug")
     ap.add_argument("-k", "--dbg", choices=["frida", "ida"], default="ida", help="Debugger kind")
     ap.add_argument("-n", "--name", help="Debugger Server name")
+    ap.add_argument("-c", "--clear", default=False, action="store_true", help="clear app data")
     ap.add_argument("--skip-jdwp", default=False, action="store_true", help="Skip jdwp")
     ap.add_argument("--dbg-path", default="/data/local/tmp", help="Debugger push path")
     ap.add_argument("--apk-path", default="/data/local/tmp/apk", help="APK push path")
