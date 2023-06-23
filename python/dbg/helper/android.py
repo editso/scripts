@@ -189,7 +189,7 @@ def starting_frida(srv: str):
     print(f"[+] FridaServer Listen on 127.0.0.1:{srv_port}")
 
 
-def run_dbg(apk: str, clean=False, only_run=False, sdk=None, jdwp=5986, package=None, activity=None):
+def run_helper(apk: str, clean=False, push=True, only_run=False, sdk=None, jdwp=5986, package=None, activity=None):
     debugger = helper.use_dbg
     debug_package = package
     main_activity = activity
@@ -197,13 +197,14 @@ def run_dbg(apk: str, clean=False, only_run=False, sdk=None, jdwp=5986, package=
     if apk != "--":
         bytes_apk = open(apk, "rb").read()
         sha1_apk = hashlib.sha1(bytes_apk).hexdigest()
-
-        remote_path = adb_push(apk, f"{sha1_apk}.apk", helper.apk_push_path)
-
+        remote_path = None if push else adb_push(apk, f"{sha1_apk}.apk", helper.apk_push_path)
         package = None
 
     if apk != "--" and not package:
-        adb_shell(f"pm install {remote_path}")
+        if push:
+            adb_shell(f"pm install {remote_path}")
+        else:
+            adb_command("install", [apk])
 
         retval = adb_shell("""pm list packages -3 -f | sed -r 's/package:(.*)=(.*)/\\1 \\2/' | awk '{system("sha1sum " $1 "|xargs echo " $2);}'""").split("\n")
 
@@ -276,7 +277,7 @@ def run_main(app: argparse.Namespace):
 
     retval = get_devices()
 
-    if app.serial and app.serial not in retval:
+    if app.serial and app.serial not in retval and len(app.serial.split(":")) == 2:
         retval = adb_command("connect", app.serial)
         if "failed" in retval:
             print(f"[-] device connect fail {app.serial}")
@@ -320,7 +321,7 @@ def run_main(app: argparse.Namespace):
     helper.apk_push_path = app.apk_path
     helper.dbg_push_path = app.dbg_path
 
-    run_dbg(app.APK, app.clear, app.run, app.sdk, app.jdwp, app.package, app.activity)
+    run_helper(app.APK, app.clear, app.no_push, app.run, app.sdk, app.jdwp, app.package, app.activity)
 
 
 if __name__ == "__main__":
@@ -338,6 +339,7 @@ if __name__ == "__main__":
     ap.add_argument("-n", "--name", help="Debugger Server name")
     ap.add_argument("-c", "--clear", default=False, action="store_true", help="clear app data")
     ap.add_argument("--skip-jdwp", default=False, action="store_true", help="Skip jdwp")
+    ap.add_argument("--no-push", default=True, action="store_false", help="Do not upload apk")
     ap.add_argument("--dbg-path", default="/data/local/tmp", help="Debugger push path")
     ap.add_argument("--apk-path", default="/data/local/tmp/apk", help="APK push path")
     ap.add_argument("APK", nargs="?", default="--")
