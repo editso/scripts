@@ -25,6 +25,7 @@ class Helper:
         self.dbg_push_path = dbg_push_path
         self.apk_push_path = apk_push_path
         self.skip_jdwp = skip_jdwp
+        self.auto_input = False
         self._srv_name = None
 
     @property
@@ -133,63 +134,54 @@ def adb_push(local_file: str, name: str, remote_path: str):
     return str(remote_file)
 
 
-def starting_ida(srv: str):
-    srv_name = helper.srv_name
-    srv_port = helper.dbg_port
-    remote_path = helper.dbg_push_path
+def debugger(name):
+    def wrapper_dbg(run_dbg):
+        def do_dbg(*args, **kwargs):
+            try:
+                return run_dbg(*args, **kwargs)
+            except Exception as e:
+                print(f"[-] {name} error: {e}")
 
-    adb_kill(srv_name)
+        def launcher(srv, *args, **kwargs):
+            srv_name = helper.srv_name
+            srv_port = helper.dbg_port
+            remote_path = helper.dbg_push_path
+            adb_kill(srv_name)
+            dbg_prog = adb_push(srv, srv_name, remote_path)
+            adb_shell(f"chmod +x {dbg_prog}")
+            launcher = threading.Thread(target=lambda: do_dbg(dbg_prog, srv_port, *args, **kwargs))
+            launcher.start()
+            launcher.join(2)
+            print(f"[+] {name} DebuggerServer Listen on 127.0.0.1:{srv_port}")
+            adb_command("forward", [f"tcp:{srv_port}", f"tcp:{srv_port}"])
+            return launcher
 
-    ida_prog = adb_push(srv, srv_name, remote_path)
+        return launcher
 
-    def detach_ida():
-        try:
-            adb_shell(f"chmod +x {ida_prog}")
-            adb_shell(f"{ida_prog} -p {srv_port} -K")
-        except Exception as e:
-            print("Ida DebuggerServer error {}".format(e))
-
-    adb_command("forward", [f"tcp:{srv_port}", f"tcp:{srv_port}"])
-
-    thread = threading.Thread(target=detach_ida)
-    thread.start()
-    thread.join(2)
-
-    if not thread.is_alive():
-        raise ChildProcessError("IDA DebuggerServer launch fail")
-
-    print(f"[+] Ida DebuggerServer Listen on 127.0.0.1:{srv_port}")
-
-
-def starting_frida(srv: str):
-    srv_name = helper.srv_name
-    srv_port = helper.dbg_port
-    remote_path = helper.dbg_push_path
-
-    adb_kill(srv_name)
-
-    frida_prog = adb_push(srv, srv_name, remote_path)
-
-    def detach_frida():
-        try:
-            adb_shell(f"chmod +x {frida_prog}")
-            adb_shell(f"{frida_prog} -l 0.0.0.0:{srv_port}")
-        except Exception as e:
-            print("FridaServer error {}".format(e))
-
-    adb_command("forward", [f"tcp:{srv_port}", f"tcp:{srv_port}"])
-
-    thread = threading.Thread(target=detach_frida)
-    thread.start()
-    thread.join(2)
-
-    if not thread.is_alive():
-        raise ChildProcessError("FridaServer launch fail")
-
-    print(f"[+] FridaServer Listen on 127.0.0.1:{srv_port}")
+    return wrapper_dbg
 
 
-def run_helper(apk: str, clean=False, push=True, only_run=False, sdk=None, jdwp=5986, package=None, activity=None):
+@debugger("IDA")
+def starting_ida(ida_prog, srv_port, *args):
+    adb_shell(f"{ida_prog} -p {srv_port} -K")
+
+
+@debugger("GDB")
+def starting_gdb(gdb_prog, srv_port, attach_pid) -> None:
+    adb_shell(f"{gdb_prog} 127.0.0.1:{srv_port} --attach {attach_pid}")
+
+
+@debugger("Frida")
+def starting_frida(frida_prog: str, srv_port, *args):
+    adb_shell(f"{frida_prog} -l 0.0.0.0:{srv_port}")
+
+
+@debugger("LLDB")
+def starting_lldb(lldb_prog: str, srv_port, attach_pid, *args):
+    adb_shell(f"{lldb_prog} g 0.0.0.0:{srv_port} --attach {attach_pid}")
+
+
+def do_helper(apk: str, clean=False, push=True, only_run=False, sdk=None, jdwp=5986, package=None, activity=None):
     debugger = helper.use_dbg
     debug_package = package
     main_activity = activity
@@ -197,7 +189,7 @@ def run_helper(apk: str, clean=False, push=True, only_run=False, sdk=None, jdwp=
     if apk != "--":
         bytes_apk = open(apk, "rb").read()
         sha1_apk = hashlib.sha1(bytes_apk).hexdigest()
-        remote_path = None if push else adb_push(apk, f"{sha1_apk}.apk", helper.apk_push_path)
+        remote_path = None if not push else adb_push(apk, f"{sha1_apk}.apk", helper.apk_push_path)
         package = None
 
     if apk != "--" and not package:
@@ -231,6 +223,9 @@ def run_helper(apk: str, clean=False, push=True, only_run=False, sdk=None, jdwp=
         if not main_activity:
             raise NameError("activity not found")
 
+    adb_kill(helper.srv_name)
+    adb_kill(debug_package)
+
     adb_shell(" ".join(["am start", "" if only_run else "-D", "-n", main_activity]))
 
     time.sleep(2)
@@ -250,23 +245,24 @@ def run_helper(apk: str, clean=False, push=True, only_run=False, sdk=None, jdwp=
 
     print(f"[+] {debug_package} started. pid is {debug_process}")
 
+    if helper.dbg_srv:
+        ({"ida": starting_ida, "gdb": starting_gdb, "lldb": starting_lldb, "frida": starting_frida})[debugger](helper.dbg_srv, debug_process)
+
     if only_run:
         return
-
-    if helper.dbg_srv:
-        ({"ida": starting_ida, "frida": starting_frida})[debugger](helper.dbg_srv)
 
     if helper.skip_jdwp:
         return
 
-    input("[+] Enter to start debugging (Make sure the debugger is attached): ")
+    if not helper.auto_input:
+        input("[+] Enter to start debugging (Make sure the debugger is attached): ")
 
     adb_command("forward", [f"tcp:{jdwp}", f"jdwp:{debug_process}"])
 
     connect_to_jdwp(sdk, jdwp)
 
 
-def run_main(app: argparse.Namespace):
+def do_main(app: argparse.Namespace):
     if app.APK != "--" and not os.path.exists(app.APK):
         print("[-] apk file not exists")
         sys.exit(1)
@@ -309,7 +305,7 @@ def run_main(app: argparse.Namespace):
     whoami = adb_shell("whoami").replace("\n", "")
 
     if whoami != "root":
-        adb_shell("root")
+        adb_command("root")
         if app.serial and len(app.serial.split(":")) == 2:
             adb_command("connect", [app.serial])
 
@@ -320,8 +316,9 @@ def run_main(app: argparse.Namespace):
     helper.srv_name = app.name
     helper.apk_push_path = app.apk_path
     helper.dbg_push_path = app.dbg_path
+    helper.auto_input = app.auto_input
 
-    run_helper(app.APK, app.clear, app.no_push, app.run, app.sdk, app.jdwp, app.package, app.activity)
+    do_helper(app.APK, app.clear, app.no_push, app.run, app.sdk, app.jdwp, app.package, app.activity)
 
 
 if __name__ == "__main__":
@@ -335,9 +332,10 @@ if __name__ == "__main__":
     ap.add_argument("-a", "--activity", default=None, help="APK lunch activity")
     ap.add_argument("-d", "--jdwp", default=5986, type=int)
     ap.add_argument("-r", "--run", default=False, action="store_true", help="Run but not debug")
-    ap.add_argument("-k", "--dbg", choices=["frida", "ida"], default="ida", help="Debugger kind")
+    ap.add_argument("-t", "--dbg", choices=["ida", "gdb", "lldb", "frida"], default="ida", help="Target debugger")
     ap.add_argument("-n", "--name", help="Debugger Server name")
     ap.add_argument("-c", "--clear", default=False, action="store_true", help="clear app data")
+    ap.add_argument("-y", "--auto-input", default=False, action="store_true", help="auto input")
     ap.add_argument("--skip-jdwp", default=False, action="store_true", help="Skip jdwp")
     ap.add_argument("--no-push", default=True, action="store_false", help="Do not upload apk")
     ap.add_argument("--dbg-path", default="/data/local/tmp", help="Debugger push path")
@@ -345,7 +343,7 @@ if __name__ == "__main__":
     ap.add_argument("APK", nargs="?", default="--")
 
     try:
-        run_main(ap.parse_args())
+        do_main(ap.parse_args())
         sys.exit(0)
     except Exception as e:
         print("[-] Err {}".format(e))
