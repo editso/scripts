@@ -1,13 +1,15 @@
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+import time
+import shutil
+import hashlib
+import pathlib
 import argparse
 import subprocess
-import shutil
-import os
-import sys
-import hashlib
-import re
-import time
 import threading
-import pathlib
 
 
 class Helper:
@@ -27,9 +29,12 @@ class Helper:
         self.skip_jdwp = skip_jdwp
         self.auto_input = False
         self._srv_name = None
+        self.debuggers = {}
+        self.srv_names = {}
 
     @property
     def srv_name(self):
+        self._srv_name = self._srv_name if self._srv_name else self.srv_names.get(self.use_dbg)
         return self._srv_name if self._srv_name else f"{self.use_dbg}_srv"
 
     @srv_name.setter
@@ -134,7 +139,7 @@ def adb_push(local_file: str, name: str, remote_path: str):
     return str(remote_file)
 
 
-def debugger(name):
+def debugger(id, name, srv_name=None, hint=None):
     def wrapper_dbg(run_dbg):
         def do_dbg(*args, **kwargs):
             try:
@@ -142,73 +147,80 @@ def debugger(name):
             except Exception as e:
                 print(f"[-] {name} error: {e}")
 
-        def launcher(srv, *args, **kwargs):
+        def launcher(srv, attach_pid, *args, **kwargs):
             srv_name = helper.srv_name
             srv_port = helper.dbg_port
             remote_path = helper.dbg_push_path
             adb_kill(srv_name)
             dbg_prog = adb_push(srv, srv_name, remote_path)
             adb_shell(f"chmod +x {dbg_prog}")
-            launcher = threading.Thread(target=lambda: do_dbg(dbg_prog, srv_port, *args, **kwargs))
+            launcher = threading.Thread(target=lambda: do_dbg(dbg_prog, srv_port, attach_pid, *args, **kwargs))
             launcher.start()
             launcher.join(2)
             print(f"[+] {name} DebuggerServer Listen on 127.0.0.1:{srv_port}")
             adb_command("forward", [f"tcp:{srv_port}", f"tcp:{srv_port}"])
+            if hint:
+                print("[*] hint: {}".format(hint.format(srv_port=srv_port, attach_pid=attach_pid)))
             return launcher
+
+        helper.srv_names[id] = srv_name
+        helper.debuggers[id] = launcher
 
         return launcher
 
     return wrapper_dbg
 
 
-@debugger("IDA")
+@debugger("ida", "IDA")
 def starting_ida(ida_prog, srv_port, *args):
     adb_shell(f"{ida_prog} -p {srv_port} -K")
 
 
-@debugger("GDB")
+@debugger("gdb", "GDB")
 def starting_gdb(gdb_prog, srv_port, attach_pid) -> None:
     adb_shell(f"{gdb_prog} 127.0.0.1:{srv_port} --attach {attach_pid}")
 
 
-@debugger("Frida")
+@debugger("frida", "Frida")
 def starting_frida(frida_prog: str, srv_port, *args):
     adb_shell(f"{frida_prog} -l 0.0.0.0:{srv_port}")
 
 
-@debugger("LLDB")
+@debugger("lldb", "LLDB", hint="lldb -o 'platform select remote-android' -o 'platform connect connect://127.0.0.1:{srv_port}' -o 'attach --pid {attach_pid}'")
 def starting_lldb(lldb_prog: str, srv_port, attach_pid, *args):
+    adb_shell(f"{lldb_prog} p --listen 0.0.0.0:{srv_port} --server")
+
+
+@debugger("lldb-gdb", "LLDB-GDB", "lldb_srv", "lldb -o 'gdb-remote 127.0.0.1:{srv_port}'")
+def starting_lldb_gdb(lldb_prog: str, srv_port, attach_pid, *args):
     adb_shell(f"{lldb_prog} g 0.0.0.0:{srv_port} --attach {attach_pid}")
 
 
-def do_helper(apk: str, clean=False, push=True, only_run=False, sdk=None, jdwp=5986, package=None, activity=None):
-    debugger = helper.use_dbg
+def do_pre_launch(apk: str, attach=False, clean=False, push=True, package=None, activity=None):
     debug_package = package
     main_activity = activity
 
-    if apk != "--":
+    if apk:
         bytes_apk = open(apk, "rb").read()
         sha1_apk = hashlib.sha1(bytes_apk).hexdigest()
-        remote_path = None if not push else adb_push(apk, f"{sha1_apk}.apk", helper.apk_push_path)
-        package = None
 
-    if apk != "--" and not package:
-        if push:
-            adb_shell(f"pm install {remote_path}")
-        else:
-            adb_command("install", [apk])
+        if not attach:
+            remote_path = None if not push else adb_push(apk, f"{sha1_apk}.apk", helper.apk_push_path)
+            adb_shell(f"pm install -r {remote_path}") if push else adb_command("install", [apk])
+            package = None
 
-        retval = adb_shell("""pm list packages -3 -f | sed -r 's/package:(.*)=(.*)/\\1 \\2/' | awk '{system("sha1sum " $1 "|xargs echo " $2);}'""").split("\n")
+        if not package:
+            retval = adb_shell("""pm list packages -3 -f | sed -r 's/package:(.*)=(.*)/\\1 \\2/' | awk '{system("sha1sum " $1 "|xargs echo " $2);}'""").split("\n")
 
-        for app in retval:
-            if sha1_apk in app:
-                debug_package = app.split(" ")[0].strip()
-                break
+            for app in retval:
+                if sha1_apk in app:
+                    debug_package = app.split(" ")[0].strip()
+                    break
 
-        if not debug_package:
-            raise FileExistsError(f"{apk} install fail")
+            if not debug_package:
+                raise FileExistsError(f"{apk} install fail")
 
-    if clean:
+    if not attach and clean:
         adb_shell(f"pm clear {debug_package}")
 
     if not main_activity:
@@ -223,12 +235,29 @@ def do_helper(apk: str, clean=False, push=True, only_run=False, sdk=None, jdwp=5
         if not main_activity:
             raise NameError("activity not found")
 
+    return debug_package, main_activity
+
+
+def do_helper(apk: str, attach: str, clean=False, push=True, only_run=False, sdk=None, jdwp=5986, package=None, activity=None):
+    debugger = helper.use_dbg
+
+    debug_package, main_activity = do_pre_launch(apk, attach != None, clean, push, package, activity)
+
     adb_kill(helper.srv_name)
-    adb_kill(debug_package)
 
-    adb_shell(" ".join(["am start", "" if only_run else "-D", "-n", main_activity]))
-
-    time.sleep(2)
+    if attach == 'jd':
+        helper.skip_jdwp = False
+        helper.auto_input = False
+    elif attach == "dbg":
+        helper.skip_jdwp = True
+    elif attach == "jdwp":
+        helper.dbg_srv = None
+        helper.auto_input = True
+        helper.skip_jdwp = False
+    else:
+        adb_kill(debug_package)
+        adb_shell(" ".join(["am start", "" if only_run else "-D", "-n", main_activity]))
+        time.sleep(2)
 
     retval = adb_shell(f"ps -ef | grep {debug_package}").split("\n")
 
@@ -246,7 +275,7 @@ def do_helper(apk: str, clean=False, push=True, only_run=False, sdk=None, jdwp=5
     print(f"[+] {debug_package} started. pid is {debug_process}")
 
     if helper.dbg_srv:
-        ({"ida": starting_ida, "gdb": starting_gdb, "lldb": starting_lldb, "frida": starting_frida})[debugger](helper.dbg_srv, debug_process)
+        (helper.debuggers)[debugger](helper.dbg_srv, debug_process)
 
     if only_run:
         return
@@ -255,7 +284,7 @@ def do_helper(apk: str, clean=False, push=True, only_run=False, sdk=None, jdwp=5
         return
 
     if not helper.auto_input:
-        input("[+] Enter to start debugging (Make sure the debugger is attached): ")
+        input(f"[+] Enter to start debugging (Make sure the debugger is attached. pid is {debug_process}): ")
 
     adb_command("forward", [f"tcp:{jdwp}", f"jdwp:{debug_process}"])
 
@@ -318,7 +347,7 @@ def do_main(app: argparse.Namespace):
     helper.dbg_push_path = app.dbg_path
     helper.auto_input = app.auto_input
 
-    do_helper(app.APK, app.clear, app.no_push, app.run, app.sdk, app.jdwp, app.package, app.activity)
+    do_helper(app.APK, app.attach, app.clear, app.no_push, app.run, app.sdk, app.jdwp, app.package, app.activity)
 
 
 if __name__ == "__main__":
@@ -332,15 +361,16 @@ if __name__ == "__main__":
     ap.add_argument("-a", "--activity", default=None, help="APK lunch activity")
     ap.add_argument("-d", "--jdwp", default=5986, type=int)
     ap.add_argument("-r", "--run", default=False, action="store_true", help="Run but not debug")
-    ap.add_argument("-t", "--dbg", choices=["ida", "gdb", "lldb", "frida"], default="ida", help="Target debugger")
+    ap.add_argument("-t", "--dbg", choices=tuple(helper.debuggers.keys()), default="ida", help="Target debugger")
     ap.add_argument("-n", "--name", help="Debugger Server name")
     ap.add_argument("-c", "--clear", default=False, action="store_true", help="clear app data")
     ap.add_argument("-y", "--auto-input", default=False, action="store_true", help="auto input")
+    ap.add_argument("--attach", default=None, choices=["jd", "dbg", "jdwp"], help="attach to running process")
     ap.add_argument("--skip-jdwp", default=False, action="store_true", help="Skip jdwp")
     ap.add_argument("--no-push", default=True, action="store_false", help="Do not upload apk")
     ap.add_argument("--dbg-path", default="/data/local/tmp", help="Debugger push path")
     ap.add_argument("--apk-path", default="/data/local/tmp/apk", help="APK push path")
-    ap.add_argument("APK", nargs="?", default="--")
+    ap.add_argument("APK", nargs="?", default=None)
 
     try:
         do_main(ap.parse_args())
